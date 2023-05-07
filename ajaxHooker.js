@@ -1,22 +1,18 @@
 // ==UserScript==
 // @name         ajaxHooker
 // @author       cxxjackie
-// @version      1.2.3
+// @version      1.3.0-beta.1
 // @supportURL   https://bbs.tampermonkey.net.cn/thread-3284-1-1.html
 // ==/UserScript==
 
 var ajaxHooker = function() {
     const win = window.unsafeWindow || document.defaultView || window;
+    const toString = Object.prototype.toString;
+    const getDescriptor = Object.getOwnPropertyDescriptor;
     const hookFns = [];
     const realXhr = win.XMLHttpRequest;
-    const xhrProto = realXhr.prototype;
-    const xhrProtoDesc = Object.getOwnPropertyDescriptors(xhrProto);
-    const xhrReadyState = xhrProtoDesc.readyState.get;
-    const resProto = win.Response.prototype;
-    const toString = Object.prototype.toString;
-    let realXhrOpen = xhrProto.open;
-    let realXhrSend = xhrProto.send;
     const realFetch = win.fetch;
+    const resProto = win.Response.prototype;
     const xhrResponses = ['response', 'responseText', 'responseXML'];
     const fetchResponses = ['arrayBuffer', 'blob', 'formData', 'json', 'text'];
     const xhrAsyncEvents = ['readystatechange', 'load', 'loadend'];
@@ -44,131 +40,206 @@ var ajaxHooker = function() {
             value: value
         });
     }
-    function toFilterObj(obj) {
-        return {
-            type: obj.type,
-            url: obj.url,
-            method: obj.method && obj.method.toUpperCase()
-        };
-    }
     function shouldFilter(type, url, method) {
-        return filter && !filter.find(obj => 
-            (!obj.type || obj.type === type)
-            && (!obj.url || (toString.call(obj.url) === '[object String]' ? url.includes(obj.url) : obj.url.test(url)))
-            && (!obj.method || obj.method === method.toUpperCase())
-        );
+        return filter && !filter.find(obj => {
+            switch (true) {
+                case obj.type && obj.type !== type:
+                case toString.call(obj.url) === '[object String]' && !url.includes(obj.url):
+                case toString.call(obj.url) === '[object RegExp]' && !obj.url.test(url):
+                case obj.method && obj.method.toUpperCase() !== method.toUpperCase():
+                    return false;
+            }
+            return true;
+        });
     }
-    function waitForHookFns(request) {
-        return Promise.all(hookFns.map(fn => Promise.resolve(fn(request)).then(emptyFn, errorFn)));
-    }
-    function waitForRequestKeys(request, requestClone) {
-        return Promise.all(['url', 'method', 'abort', 'headers', 'data'].map(key => {
-            return Promise.resolve(request[key]).then(val => request[key] = val, () => request[key] = requestClone[key]);
-        }));
-    }
-    function fakeEventSIP() {
-        this.ajaxHooker_stopped = true;
-    }
-    function xhrDelegateEvent(e) {
-        const xhr = e.target;
-        e.stopImmediatePropagation = fakeEventSIP;
-        xhr.__ajaxHooker.hookedEvents[e.type].forEach(fn => !e.ajaxHooker_stopped && fn.call(xhr, e));
-        const onEvent = xhr.__ajaxHooker.hookedEvents['on' + e.type];
-        typeof onEvent === 'function' && onEvent.call(xhr, e);
-    }
-    function xhrReadyStateChange(e) {
-        if (xhrReadyState.call(e.target) === 4) {
-            e.target.dispatchEvent(new CustomEvent('ajaxHooker_responseReady', {detail: e}));
-        } else {
-            e.target.__ajaxHooker.delegateEvent(e);
-        }
-    }
-    function xhrLoadAndLoadend(e) {
-        e.target.__ajaxHooker.delegateEvent(e);
-    }
-    function fakeXhr() {
-        const xhr = new realXhr();
-        realXhrSend = xhr.send;
-        xhr.send = fakeXhrSend;
-        if (!('__ajaxHooker' in xhr)) {
-            realXhrOpen = xhr.open;
-            xhr.open = fakeXhrOpen;
-            try {
-                const ah = xhr.__ajaxHooker = {
-                    headers: {},
-                    hookedEvents: {
-                        readystatechange: new Set(),
-                        load: new Set(),
-                        loadend: new Set()
-                    },
-                    delegateEvent: xhrDelegateEvent
-                };
-                xhr.setRequestHeader = (header, value) => {
-                    xhrProto.setRequestHeader.call(xhr, header, value);
-                    if (xhrReadyState.call(xhr) === 1) {
-                        if (ah.headers[header]) {
-                            ah.headers[header] += ', ' + value;
-                        } else {
-                            ah.headers[header] = value;
-                        }
+    function parseHeaders(obj) {
+        const headers = {};
+        switch (toString.call(obj)) {
+            case '[object String]':
+                for (const line of obj.trim().split(/[\r\n]+/)) {
+                    const parts = line.split(/\s*:\s*/);
+                    if (parts.length !== 2) continue;
+                    const lheader = parts[0].toLowerCase();
+                    if (lheader in headers) {
+                        headers[lheader] += ', ' + parts[1];
+                    } else {
+                        headers[lheader] = parts[1];
                     }
                 }
-                const realAddEvent = xhr.addEventListener;
-                xhr.addEventListener = function(...args) {
-                    if (xhrAsyncEvents.includes(args[0])) {
-                        ah.hookedEvents[args[0]].add(args[1]);
-                    } else {
-                        realAddEvent.apply(xhr, args);
-                    }
-                };
-                const realRemoveEvent = xhr.removeEventListener;
-                xhr.removeEventListener = function(...args) {
-                    if (xhrAsyncEvents.includes(args[0])) {
-                        ah.hookedEvents[args[0]].delete(args[1]);
-                    } else {
-                        realRemoveEvent.apply(xhr, args);
-                    }
-                };
-                xhrAsyncEvents.forEach(evt => {
-                    const onEvt = 'on' + evt;
-                    defineProp(xhr, onEvt, () => {
-                        return ah.hookedEvents[onEvt] || null;
-                    }, val => {
-                        ah.hookedEvents[onEvt] = typeof val === 'function' ? val : null;
-                    });
-                });
-                realAddEvent.call(xhr, 'readystatechange', xhrReadyStateChange);
-                realAddEvent.call(xhr, 'load', xhrLoadAndLoadend);
-                realAddEvent.call(xhr, 'loadend', xhrLoadAndLoadend);
-            } catch (err) {
+                return headers;
+            case '[object Headers]':
+                for (const [key, val] of obj) {
+                    headers[key] = val;
+                }
+                return headers;
+            case '[object Object]':
+                return {...obj};
+            default:
+                return headers;
+        }
+    }
+    class AHRequest {
+        constructor(request) {
+            this.request = request;
+            this.requestClone = {...this.request};
+            this.response = {};
+        }
+        waitForHookFns() {
+            return Promise.all(hookFns.map(fn => {
+                try {
+                    return Promise.resolve(fn(this.request)).then(emptyFn, errorFn);
+                } catch (err) {
+                    console.error(err);
+                }
+            }));
+        }
+        waitForResponseFn() {
+            try {
+                return Promise.resolve(this.request.response(this.response)).then(emptyFn, errorFn);
+            } catch {
                 console.error(err);
+                return Promise.resolve();
             }
         }
-        return xhr;
+        waitForRequestKeys() {
+            if (this.reqPromise) return this.reqPromise;
+            const requestKeys = ['url', 'method', 'abort', 'headers', 'data'];
+            return this.reqPromise = this.waitForHookFns().then(() => Promise.all(
+                requestKeys.map(key => Promise.resolve(this.request[key]).then(
+                    val => this.request[key] = val,
+                    e => this.request[key] = this.requestClone[key]
+                ))
+            ));
+        }
+        waitForResponseKeys() {
+            if (this.resPromise) return this.resPromise;
+            const responseKeys = this.request.type === 'xhr' ? xhrResponses : fetchResponses;
+            return this.resPromise = this.waitForResponseFn().then(() => Promise.all(
+                responseKeys.map(key => {
+                    const descriptor = getDescriptor(this.response, key);
+                    if (descriptor && 'value' in descriptor) {
+                        return Promise.resolve(descriptor.value).then(
+                            val => this.response[key] = val,
+                            e => delete this.response[key]
+                        );
+                    } else {
+                        delete this.response[key];
+                    }
+                })
+            ));
+        }
     }
-    function fakeXhrOpen(method, url, ...args) {
-        const xhr = this;
-        xhr.__ajaxHooker.url = url;
-        xhr.__ajaxHooker.method = method.toUpperCase();
-        xhr.__ajaxHooker.openArgs = args;
-        xhr.__ajaxHooker.headers = {};
-        return realXhrOpen.call(xhr, method, url, ...args);
-    }
-    function fakeXhrSend(data) {
-        const xhr = this;
-        const ah = xhr.__ajaxHooker;
-        if (xhrReadyState.call(xhr) === 1 && ah) {
-            ah.delegateEvent = xhrDelegateEvent;
-            xhrResponses.forEach(prop => {
-                delete xhr[prop]; // delete descriptor
-            });
-            if (shouldFilter('xhr', ah.url, ah.method)) {
-                xhr.addEventListener('ajaxHooker_responseReady', e => {
-                    ah.delegateEvent(e.detail);
-                });
-                return realXhrSend.call(xhr, data);
+    class XhrEvents {
+        constructor() {
+            this.events = {};
+        }
+        add(type, event) {
+            if (type.startsWith('on')) {
+                this.events[type] = typeof event === 'function' ? event : null;
+            } else {
+                this.events[type] = this.events[type] || new Set();
+                this.events[type].add(event);
             }
-            try {
+        }
+        remove(type, event) {
+            if (type.startsWith('on')) {
+                this.events[type] = null;
+            } else {
+                this.events[type] && this.events[type].delete(event);
+            }
+        }
+        _sIP() {
+            this.ajaxHooker_isStopped = true;
+        }
+        trigger(e) {
+            if (e.ajaxHooker_isTriggered || e.ajaxHooker_isStopped) return;
+            e.stopImmediatePropagation = this._sIP;
+            this.events[e.type] && this.events[e.type].forEach(fn => {
+                !e.ajaxHooker_isStopped && fn.call(e.target, e);
+            });
+            this.events['on' + e.type] && this.events['on' + e.type].call(e.target, e);
+            e.ajaxHooker_isTriggered = true;
+        }
+        clone() {
+            const eventsClone = new XhrEvents();
+            for (const type in this.events) {
+                if (type.startsWith('on')) {
+                    eventsClone.events[type] = this.events[type];
+                } else {
+                    eventsClone.events[type] = new Set([...this.events[type]]);
+                }
+            }
+            return eventsClone;
+        }
+    }
+    const xhrMethods = {
+        readyStateChange(e) {
+            if (e.target.readyState === 4) {
+                e.target.dispatchEvent(new CustomEvent('ajaxHooker_responseReady', {detail: e}));
+            } else {
+                e.target.__ajaxHooker.eventTrigger(e);
+            }
+        },
+        asyncListener(e) {
+            e.target.__ajaxHooker.eventTrigger(e);
+        },
+        setRequestHeader(header, value) {
+            const ah = this.__ajaxHooker;
+            ah.originalXhr.setRequestHeader(header, value);
+            if (this.readyState !== 1) return;
+            if (header in ah.headers) {
+                ah.headers[header] += ', ' + value;
+            } else {
+                ah.headers[header] = value;
+            }
+        },
+        addEventListener(...args) {
+            const ah = this.__ajaxHooker;
+            if (xhrAsyncEvents.includes(args[0])) {
+                ah.proxyEvents.add(args[0], args[1]);
+            } else {
+                ah.originalXhr.addEventListener(...args);
+            }
+        },
+        removeEventListener(...args) {
+            const ah = this.__ajaxHooker;
+            if (xhrAsyncEvents.includes(args[0])) {
+                ah.proxyEvents.remove(args[0], args[1]);
+            } else {
+                ah.originalXhr.removeEventListener(...args);
+            }
+        },
+        open(method, url, ...args) {
+            const ah = this.__ajaxHooker;
+            ah.url = url.toString();
+            ah.method = method.toUpperCase();
+            ah.openArgs = args;
+            ah.headers = {};
+            for (const key of xhrResponses) {
+                ah.proxyProps[key] = {
+                    get: () => {
+                        const val = ah.originalXhr[key];
+                        ah.originalXhr.dispatchEvent(new CustomEvent('ajaxHooker_readResponse', {
+                            detail: {key, val}
+                        }));
+                        return val;
+                    }
+                };
+            }
+            return ah.originalXhr.open(method, url, ...args);
+        },
+        sendFactory(realSend) {
+            return function(data) {
+                const ah = this.__ajaxHooker;
+                const xhr = ah.originalXhr;
+                if (xhr.readyState !== 1) return realSend.call(xhr, data);
+                ah.eventTrigger = e => ah.proxyEvents.trigger(e);
+                if (shouldFilter('xhr', ah.url, ah.method)) {
+                    xhr.addEventListener('ajaxHooker_responseReady', e => {
+                        ah.eventTrigger(e.detail);
+                    }, {once: true});
+                    return realSend.call(xhr, data);
+                }
                 const request = {
                     type: 'xhr',
                     url: ah.url,
@@ -178,125 +249,133 @@ var ajaxHooker = function() {
                     data: data,
                     response: null
                 };
-                const requestClone = {...request};
-                waitForHookFns(request).then(() => {
-                    waitForRequestKeys(request, requestClone).then(() => {
-                        if (request.abort) return;
-                        realXhrOpen.call(xhr, request.method, request.url, ...ah.openArgs);
-                        for (const header in request.headers) {
-                            xhrProto.setRequestHeader.call(xhr, header, request.headers[header]);
-                        }
-                        data = request.data;
-                        xhr.addEventListener('ajaxHooker_responseReady', e => {
-                            try {
-                                if (typeof request.response === 'function') {
-                                    const arg = {
-                                        finalUrl: xhr.responseURL,
-                                        status: xhr.status,
-                                        responseHeaders: {}
-                                    };
-                                    for (const line of xhr.getAllResponseHeaders().trim().split(/[\r\n]+/)) {
-                                        const parts = line.split(/:\s*/);
-                                        if (parts.length === 2) {
-                                            const lheader = parts[0].toLowerCase();
-                                            if (arg.responseHeaders[lheader]) {
-                                                arg.responseHeaders[lheader] += ', ' + parts[1];
-                                            } else {
-                                                arg.responseHeaders[lheader] = parts[1];
-                                            }
-                                        }
-                                    }
-                                    xhrResponses.forEach(prop => {
-                                        defineProp(arg, prop, () => {
-                                            return arg[prop] = xhrProtoDesc[prop].get.call(xhr);
-                                        }, val => {
-                                            delete arg[prop];
-                                            arg[prop] = val;
-                                        });
-                                        defineProp(xhr, prop, () => {
-                                            const val = xhrProtoDesc[prop].get.call(xhr);
-                                            xhr.dispatchEvent(new CustomEvent('ajaxHooker_readResponse', {
-                                                detail: {prop, val}
-                                            }));
-                                            return val;
-                                        });
-                                    });
-                                    xhr.addEventListener('ajaxHooker_readResponse', e => {
-                                        arg[e.detail.prop] = e.detail.val;
-                                    });
-                                    const resPromise = Promise.resolve(request.response(arg)).then(() => {
-                                        const task = [];
-                                        xhrResponses.forEach(prop => {
-                                            const descriptor = Object.getOwnPropertyDescriptor(arg, prop);
-                                            if (descriptor && 'value' in descriptor) {
-                                                task.push(Promise.resolve(descriptor.value).then(val => {
-                                                    arg[prop] = val;
-                                                    defineProp(xhr, prop, () => {
-                                                        xhr.dispatchEvent(new CustomEvent('ajaxHooker_readResponse', {
-                                                            detail: {prop, val}
-                                                        }));
-                                                        return val;
-                                                    });
-                                                }, emptyFn));
-                                            }
-                                        });
-                                        return Promise.all(task);
-                                    }, errorFn);
-                                    const eventsClone = {};
-                                    xhrAsyncEvents.forEach(type => {
-                                        eventsClone[type] = new Set([...ah.hookedEvents[type]]);
-                                        eventsClone['on' + type] = ah.hookedEvents['on' + type];
-                                    });
-                                    ah.delegateEvent = event => resPromise.then(() => {
-                                        event.stopImmediatePropagation = fakeEventSIP;
-                                        eventsClone[event.type].forEach(fn => !event.ajaxHooker_stopped && fn.call(xhr, event));
-                                        const onEvent = eventsClone['on' + event.type];
-                                        typeof onEvent === 'function' && onEvent.call(xhr, event);
-                                    });
-                                }
-                            } catch (err) {
-                                console.error(err);
-                            }
-                            ah.delegateEvent(e.detail);
-                        });
-                        realXhrSend.call(xhr, data);
-                    });
-                });
-            } catch (err) {
-                console.error(err);
-                realXhrSend.call(xhr, data);
-            }
-        } else {
-            realXhrSend.call(xhr, data);
-        }
-    }
-    function hookFetchResponse(response, arg, callback) {
-        fetchResponses.forEach(prop => {
-            response[prop] = () => new Promise((resolve, reject) => {
-                resProto[prop].call(response).then(res => {
-                    if (prop in arg) {
-                        resolve(arg[prop]);
-                    } else {
-                        try{
-                            arg[prop] = res;
-                            Promise.resolve(callback(arg)).then(() => {
-                                if (prop in arg) {
-                                    Promise.resolve(arg[prop]).then(val => resolve(arg[prop] = val), () => resolve(res));
-                                } else {
-                                    resolve(res);
-                                }
-                            }, errorFn);
-                        } catch (err) {
-                            console.error(err);
-                            resolve(res);
-                        }
+                const req = new AHRequest(request);
+                req.waitForRequestKeys().then(() => {
+                    if (request.abort) return;
+                    xhr.open(request.method, request.url, ...ah.openArgs);
+                    for (const header in request.headers) {
+                        xhr.setRequestHeader(header, request.headers[header]);
                     }
+                    data = request.data;
+                    xhr.addEventListener('ajaxHooker_responseReady', e => {
+                        if (typeof request.response !== 'function') return ah.eventTrigger(e.detail);
+                        req.response = {
+                            finalUrl: xhr.responseURL,
+                            status: xhr.status,
+                            responseHeaders: parseHeaders(xhr.getAllResponseHeaders())
+                        };
+                        for (const key of xhrResponses) {
+                            defineProp(req.response, key, () => {
+                                return req.response[key] = ah.originalXhr[key];
+                            }, val => {
+                                delete req.response[key];
+                                req.response[key] = val;
+                            });
+                        }
+                        const resPromise = req.waitForResponseKeys().then(() => {
+                            for (const key of xhrResponses) {
+                                if (!(key in req.response)) continue;
+                                ah.proxyProps[key] = {
+                                    get: () => {
+                                        const val = req.response[key];
+                                        xhr.dispatchEvent(new CustomEvent('ajaxHooker_readResponse', {
+                                            detail: {key, val}
+                                        }));
+                                        return val;
+                                    }
+                                };
+                            }
+                        });
+                        xhr.addEventListener('ajaxHooker_readResponse', e => {
+                            const descriptor = getDescriptor(req.response, e.detail.key);
+                            if (!descriptor || 'get' in descriptor) {
+                                req.response[e.detail.key] = e.detail.val;
+                            }
+                        });
+                        const eventsClone = ah.proxyEvents.clone();
+                        ah.eventTrigger = event => resPromise.then(() => eventsClone.trigger(event));
+                        ah.eventTrigger(e.detail);
+                    }, {once: true});
+                    realSend.call(xhr, data);
+                });
+            };
+        }
+    };
+    function fakeXhr() {
+        const xhr = new realXhr();
+        let ah = xhr.__ajaxHooker;
+        let xhrProxy = xhr;
+        if (!ah) {
+            const proxyEvents = new XhrEvents();
+            ah = xhr.__ajaxHooker = {
+                headers: {},
+                originalXhr: xhr,
+                proxyProps: {},
+                proxyEvents: proxyEvents,
+                eventTrigger: e => proxyEvents.trigger(e),
+            };
+            xhrProxy = new Proxy(xhr, {
+                get(target, prop) {
+                    try {
+                        if (target === xhr) {
+                            if (prop in ah.proxyProps) {
+                                const descriptor = ah.proxyProps[prop];
+                                return descriptor.get ? descriptor.get() : descriptor.value;
+                            }
+                            if (typeof xhr[prop] === 'function') return xhr[prop].bind(xhr);
+                        }
+                    } catch (err) {
+                        console.error(err);
+                    }
+                    return target[prop];
+                },
+                set(target, prop, value) {
+                    try {
+                        if (target === xhr && prop in ah.proxyProps) {
+                            const descriptor = ah.proxyProps[prop];
+                            descriptor.set ? descriptor.set(value) : (descriptor.value = value);
+                        } else {
+                            target[prop] = value;
+                        }
+                    } catch (err) {
+                        console.error(err);
+                    }
+                    return true;
+                }
+            });
+            xhr.addEventListener('readystatechange', xhrMethods.readyStateChange);
+            xhr.addEventListener('load', xhrMethods.asyncListener);
+            xhr.addEventListener('loadend', xhrMethods.asyncListener);
+            for (const evt of xhrAsyncEvents) {
+                const onEvt = 'on' + evt;
+                ah.proxyProps[onEvt] = {
+                    get: () => proxyEvents.events[onEvt] || null,
+                    set: val => proxyEvents.add(onEvt, val)
+                };
+            }
+            for (const method of ['setRequestHeader', 'addEventListener', 'removeEventListener', 'open']) {
+                ah.proxyProps[method] = { value: xhrMethods[method] };
+            }
+        }
+        ah.proxyProps.send = { value: xhrMethods.sendFactory(xhr.send) };
+        return xhrProxy;
+    }
+    function hookFetchResponse(response, req) {
+        for (const key of fetchResponses) {
+            response[key] = () => new Promise((resolve, reject) => {
+                if (key in req.response) return resolve(req.response[key]);
+                resProto[key].call(response).then(res => {
+                    req.response[key] = res;
+                    req.waitForResponseKeys().then(() => {
+                        resolve(key in req.response ? req.response[key] : res);
+                    });
                 }, reject);
             });
-        });
+        }
     }
     function fakeFetch(url, init) {
-        if (toString.call(url) === '[object String]') {
+        if (url && typeof url.toString === 'function') {
+            url = url.toString();
             init = init || {};
             init.method = init.method || 'GET';
             init.headers = init.headers || {};
@@ -306,52 +385,37 @@ var ajaxHooker = function() {
                 url: url,
                 method: init.method.toUpperCase(),
                 abort: false,
-                headers: {},
+                headers: parseHeaders(init.headers),
                 data: init.body,
                 response: null
             };
-            if (toString.call(init.headers) === '[object Headers]') {
-                for (const [key, val] of init.headers) {
-                    request.headers[key] = val;
-                }
-            } else {
-                request.headers = {...init.headers};
-            }
-            const requestClone = {...request};
+            const req = new AHRequest(request);
             return new Promise((resolve, reject) => {
-                try {
-                    waitForHookFns(request).then(() => {
-                        waitForRequestKeys(request, requestClone).then(() => {
-                            if (request.abort) return reject('aborted');
-                            url = request.url;
-                            init.method = request.method;
-                            init.headers = request.headers;
-                            init.body = request.data;
-                            realFetch.call(win, url, init).then(response => {
-                                if (typeof request.response === 'function') {
-                                    const arg = {
-                                        finalUrl: response.url,
-                                        status: response.status,
-                                        responseHeaders: {}
-                                    };
-                                    for (const [key, val] of response.headers) {
-                                        arg.responseHeaders[key] = val;
-                                    }
-                                    hookFetchResponse(response, arg, request.response);
-                                    response.clone = () => {
-                                        const resClone = resProto.clone.call(response);
-                                        hookFetchResponse(resClone, arg, request.response);
-                                        return resClone;
-                                    };
-                                }
-                                resolve(response);
-                            }, reject);
-                        });
-                    });
-                } catch (err) {
+                req.waitForRequestKeys().then(() => {
+                    if (request.abort) return reject(new DOMException('aborted', 'AbortError'));
+                    init.method = request.method;
+                    init.headers = request.headers;
+                    init.body = request.data;
+                    realFetch.call(win, request.url, init).then(response => {
+                        if (typeof request.response === 'function') {
+                            req.response = {
+                                finalUrl: response.url,
+                                status: response.status,
+                                responseHeaders: parseHeaders(response.headers)
+                            };
+                            hookFetchResponse(response, req);
+                            response.clone = () => {
+                                const resClone = resProto.clone.call(response);
+                                hookFetchResponse(resClone, req);
+                                return resClone;
+                            };
+                        }
+                        resolve(response);
+                    }, reject);
+                }).catch(err => {
                     console.error(err);
-                    return realFetch.call(win, url, init);
-                }
+                    resolve(realFetch.call(win, url, init));
+                });
             });
         } else {
             return realFetch.call(win, url, init);
@@ -359,12 +423,12 @@ var ajaxHooker = function() {
     }
     win.XMLHttpRequest = fakeXhr;
     Object.keys(realXhr).forEach(key => fakeXhr[key] = realXhr[key]);
-    fakeXhr.prototype = xhrProto;
+    fakeXhr.prototype = realXhr.prototype;
     win.fetch = fakeFetch;
     return {
         hook: fn => hookFns.push(fn),
         filter: arr => {
-            filter = Array.isArray(arr) && arr.map(toFilterObj)
+            filter = Array.isArray(arr) && arr;
         },
         protect: () => {
             readonly(win, 'XMLHttpRequest', fakeXhr);
